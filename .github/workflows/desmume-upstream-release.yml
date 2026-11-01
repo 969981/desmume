@@ -1,0 +1,192 @@
+name: DeSmuME Upstream Sync and Release
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Build current master even when no upstream update exists'
+        required: false
+        type: boolean
+        default: false
+  push:
+    paths:
+      - '.github/workflows/desmume-upstream-release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desmume-upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.ff.outputs.changed }}
+      sha: ${{ steps.ff.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Fast-forward master from TASEmulators/desmume
+        id: ff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/TASEmulators/desmume.git
+          git fetch --no-tags upstream master
+          git fetch --no-tags origin master
+          old="$(git rev-parse refs/remotes/origin/master)"
+          latest="$(git rev-parse refs/remotes/upstream/master)"
+          echo "sha=$latest" >> "$GITHUB_OUTPUT"
+          if [[ "$old" == "$latest" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already synchronized: $latest"
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$old" "$latest"; then
+            echo "::error::Local master diverged. Refusing to overwrite commits. Merge conflicts require manual intervention."
+            exit 1
+          fi
+          git push origin "$latest:refs/heads/master"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Synced master: $old -> $latest"
+
+  linux:
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool libglu1-mesa-dev libsdl2-dev libpcap-dev libgtk2.0-dev
+      - name: Build with GTK2 and GDB stub support
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd desmume/src/frontend/posix
+          autoreconf -i
+          ./configure --prefix=/usr --enable-gdb-stub --enable-wifi
+          make -j"$(nproc)"
+          make DESTDIR="$GITHUB_WORKSPACE/package/DeSmuME" install
+      - name: Package Linux files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -C package -cJf dist/DeSmuME-Linux-x86_64.tar.xz DeSmuME
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desmume-linux
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+      - name: Build Windows x64 with clang-cl
+        shell: cmd
+        run: |
+          set CL=-Wno-c++11-narrowing
+          msbuild "desmume/src/frontend/windows/DeSmuME.sln" /p:configuration=Release /p:platform=x64 /p:CL_cgthreads=1 /p:CLToolExe=clang-cl.exe
+          if errorlevel 1 exit /b %errorlevel%
+          call desmume\src\frontend\windows\ci_postbuild.bat
+          if errorlevel 1 exit /b %errorlevel%
+      - name: Package Windows executables
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $files = @(Get-ChildItem 'desmume/src/frontend/windows/__bins' -Filter *.exe -File)
+          if ($files.Count -eq 0) { throw 'No Windows executables were produced.' }
+          Compress-Archive -Path ($files | ForEach-Object FullName) -DestinationPath 'dist/DeSmuME-Windows-x64.zip' -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desmume-windows
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - name: Install build tools
+        run: gem install xcpretty
+      - name: Build official macOS Universal scheme
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd desmume/src/frontend/cocoa
+          xcodebuild archive \
+            -project "DeSmuME (Latest).xcodeproj" \
+            -scheme "DeSmuME (macOS App; Universal -- Latest Xcode)" \
+            -destination "generic/platform=macOS" \
+            -archivePath "$(pwd)/desmume.xcarchive" | xcpretty -c
+      - name: Package universal app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cd desmume/src/frontend/cocoa/desmume.xcarchive/Products/Applications/
+          test -d DeSmuME.app
+          ditto -c -k --sequesterRsrc --keepParent DeSmuME.app "$GITHUB_WORKSPACE/dist/DeSmuME-macOS-Universal.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desmume-macos
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [sync, linux, windows, macos]
+    if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all three successful platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: desmume-*
+          path: dist
+          merge-multiple: true
+      - name: Create pre-release for synced upstream revision
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*)
+          if [[ "${#assets[@]}" -ne 3 ]]; then
+            echo "::error::Expected all three platform archives; found ${#assets[@]}."
+            exit 1
+          fi
+          tag="upstream-${SOURCE_SHA:0:12}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; leaving it unchanged."
+            exit 0
+          fi
+          printf 'Upstream repository: https://github.com/TASEmulators/desmume\nUpstream commit: %s\n\nAutomated Windows, Linux, and macOS build, not an official DeSmuME release.\n' "$SOURCE_SHA" > release-notes.md
+          gh release create "$tag" "${assets[@]}" \
+            --target "$SOURCE_SHA" \
+            --title "DeSmuME upstream ${SOURCE_SHA:0:12}" \
+            --notes-file release-notes.md \
+            --prerelease
