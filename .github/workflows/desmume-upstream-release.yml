@@ -153,7 +153,8 @@ jobs:
   macos:
     needs: sync
     if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
-    runs-on: macos-14
+    # macos-14 was retired on 2026-11-02; use a supported Xcode runner.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
