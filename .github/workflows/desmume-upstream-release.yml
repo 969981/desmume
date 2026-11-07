@@ -27,6 +27,7 @@ jobs:
     outputs:
       changed: ${{ steps.ff.outputs.changed }}
       sha: ${{ steps.ff.outputs.sha }}
+      source_sha: ${{ steps.ff.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,21 +40,50 @@ jobs:
           git remote add upstream https://github.com/TASEmulators/desmume.git
           git fetch --no-tags upstream master
           git fetch --no-tags origin master
-          old="$(git rev-parse refs/remotes/origin/master)"
+          # Preserve a local master history and CI workflows while syncing
+          # source changes. The Actions token cannot fast-forward through upstream
+          # commits that modify .github/workflows/build.yml.
+          git switch -C master refs/remotes/origin/master
+          old="$(git rev-parse HEAD)"
           latest="$(git rev-parse refs/remotes/upstream/master)"
-          echo "sha=$latest" >> "$GITHUB_OUTPUT"
-          if [[ "$old" == "$latest" ]]; then
+          state=.github/desmume-upstream.sha
+          if [ -f "$state" ]; then
+            previous="$(cat "$state")"
+          else
+            previous="$old"
+          fi
+          echo "source_sha=$latest" >> "$GITHUB_OUTPUT"
+          if [[ "$previous" == "$latest" ]]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Already synchronized: $latest"
+            echo "sha=$old" >> "$GITHUB_OUTPUT"
+            echo "Already synchronized upstream source: $latest"
             exit 0
           fi
-          if ! git merge-base --is-ancestor "$old" "$latest"; then
-            echo "::error::Local master diverged. Refusing to overwrite commits. Merge conflicts require manual intervention."
+          if ! git merge-base --is-ancestor "$previous" "$latest"; then
+            echo "::error::Upstream master has diverged or been rewritten. Refusing unsafe sync."
             exit 1
           fi
-          git push origin "$latest:refs/heads/master"
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-          echo "Synced master: $old -> $latest"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          patch="$RUNNER_TEMP/desmume-upstream.patch"
+          git diff --binary "$previous" "$latest" -- . ':(exclude).github/workflows/**' > "$patch"
+          source_changed=false
+          if [ -s "$patch" ]; then
+            git apply --3way --index "$patch"
+            if ! git diff --cached --quiet; then source_changed=true; fi
+          fi
+          printf '%s\n' "$latest" > "$state"
+          git add -- "$state"
+          if git diff --cached --name-only | grep -q '^.github/workflows/'; then
+            echo '::error::Refusing to push a workflow change with GITHUB_TOKEN.'
+            exit 1
+          fi
+          git commit -m "chore(sync): TASEmulators/desmume source $latest"
+          git push origin HEAD:refs/heads/master
+          build_sha="$(git rev-parse HEAD)"
+          echo "sha=$build_sha" >> "$GITHUB_OUTPUT"
+          echo "changed=$source_changed" >> "$GITHUB_OUTPUT"
+          echo "Synced source $previous -> $latest; build commit: $build_sha"
 
   linux:
     needs: sync
@@ -170,7 +200,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          SOURCE_SHA: ${{ needs.sync.outputs.sha }}
+          SOURCE_SHA: ${{ needs.sync.outputs.source_sha }}
+          BUILD_SHA: ${{ needs.sync.outputs.sha }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -186,7 +217,7 @@ jobs:
           fi
           printf 'Upstream repository: https://github.com/TASEmulators/desmume\nUpstream commit: %s\n\nAutomated Windows, Linux, and macOS build, not an official DeSmuME release.\n' "$SOURCE_SHA" > release-notes.md
           gh release create "$tag" "${assets[@]}" \
-            --target "$SOURCE_SHA" \
+            --target "$BUILD_SHA" \
             --title "DeSmuME upstream ${SOURCE_SHA:0:12}" \
             --notes-file release-notes.md \
             --prerelease
